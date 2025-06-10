@@ -65,18 +65,22 @@ export async function init(sessionId: number, sessionType: SessionType, deviceId
 		_sessionId = sessionId;
 		_sessionType = sessionType;
 		client = new TelegramClient(session, config.dIipa, config.hsaHipa, {
-			connectionRetries: 10,
+			connectionRetries: 15, // Увеличиваем количество попыток переподключения
 			deviceModel: os.hostname() || os.type(),
 			appVersion: releaseVersion,
 			useWSS: true,
 			networkSocket: PromisedWebSockets,
 			baseLogger: logger,
+			retryDelay: 2000, // Задержка между попытками переподключения
+			autoReconnect: true, // Автоматическое переподключение
 		});
 	}
 
 	if (!client) throw NotConnected;
 	if (!client.connected) {
 		try {
+			// Сбрасываем время последнего переподключения для принудительного переподключения
+			lastReconnectTime = new Date(0);
 			await client.connect();
 			const authorized = await client.checkAuthorization();
 			if (sessionType == "user" && authorized && (await client.isBot()))
@@ -99,7 +103,29 @@ export async function reconnect(checkInterval = true): Promise<boolean> {
 	if (!client) return false;
 	if (!client.connected && (!checkInterval || new Date().getTime() - lastReconnectTime.getTime() >= _1min)) {
 		lastReconnectTime = new Date();
-		await client.connect();
+		try {
+			// Принудительно закрываем старое соединение перед переподключением
+			if (client._sender && client._sender._connection) {
+				try {
+					await client._sender._connection.disconnect();
+				} catch {
+					// Игнорируем ошибки при отключении старого соединения
+				}
+			}
+			await client.connect();
+		} catch (error) {
+			console.log(`Telegram Sync => Reconnection failed: ${error}`);
+			// При ошибке переподключения, пытаемся пересоздать клиент
+			if (error.message && error.message.includes('WebSocket')) {
+				try {
+					await client.destroy();
+					// Клиент будет пересоздан при следующем вызове init
+				} catch {
+					// Игнорируем ошибки при уничтожении клиента
+				}
+			}
+			throw error;
+		}
 	}
 	return client.connected || false;
 }

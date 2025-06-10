@@ -34,6 +34,12 @@ import os from "os";
 import { clearCachedUnprocessedMessages, forwardUnprocessedMessages } from "./telegram/user/sync";
 import { decrypt, encrypt } from "./utils/crypto256";
 import { PinCodeModal } from "./settings/modals/PinCode";
+// Попробуем получить доступ к Electron API через глобальный объект
+declare global {
+	interface Window {
+		require?: (module: string) => any;
+	}
+}
 
 // TODO LOW: add "connecting"
 export type ConnectionStatus = "connected" | "disconnected";
@@ -62,6 +68,9 @@ export default class TelegramSyncPlugin extends Plugin {
 	time4processOldMessages = false;
 	processOldMessagesIntervalId?: NodeJS.Timer;
 	pinCode?: string = undefined;
+	private systemSleepTime?: number;
+	private powerMonitorInitialized = false;
+	private powerMonitor?: any;
 
 	async initTelegram(initType?: Client.SessionType) {
 		this.lastPollingErrors = [];
@@ -92,6 +101,103 @@ export default class TelegramSyncPlugin extends Plugin {
 			this.time4processOldMessages = true;
 			await this.processOldMessages();
 		}
+	}
+
+	initPowerMonitor() {
+		if (this.powerMonitorInitialized || os.type() !== "Darwin") return;
+		
+		try {
+			// Пытаемся получить доступ к Electron API
+			let powerMonitor: any = null;
+			
+			// Способ 1: через require (если доступен)
+			if (typeof window !== 'undefined' && window.require) {
+				try {
+					const electron = window.require('electron');
+					powerMonitor = electron.remote?.powerMonitor || electron.powerMonitor;
+				} catch (e) {
+					// Игнорируем ошибку и пробуем другой способ
+				}
+			}
+			
+			// Способ 2: через глобальный объект (если Obsidian предоставляет доступ)
+			if (!powerMonitor && typeof (global as any) !== 'undefined') {
+				try {
+					const electron = (global as any).require?.('electron');
+					powerMonitor = electron?.remote?.powerMonitor || electron?.powerMonitor;
+				} catch (e) {
+					// Игнорируем ошибку
+				}
+			}
+			
+			if (!powerMonitor) {
+				displayAndLog(this, "PowerMonitor API not available, using alternative sleep detection", 0);
+				this.initAlternativeSleepDetection();
+				return;
+			}
+
+			// Сохраняем ссылку на powerMonitor для последующей очистки
+			this.powerMonitor = powerMonitor;
+
+			// Обработка события засыпания системы
+			this.powerMonitor.on("suspend", () => {
+				displayAndLog(this, "System is going to sleep, marking connections as disconnected", 0);
+				this.systemSleepTime = Date.now();
+				// Не отключаем соединения полностью, а только помечаем их как отключенные
+				this.setBotStatus("disconnected");
+				this.userConnected = false;
+			});
+
+			// Обработка события пробуждения системы
+			this.powerMonitor.on("resume", () => {
+				displayAndLog(this, "System resumed from sleep, reconnecting Telegram", 0);
+				const sleepDuration = this.systemSleepTime ? Date.now() - this.systemSleepTime : 0;
+				this.systemSleepTime = undefined;
+				
+				// Принудительно переподключаемся после любого сна
+				setTimeout(() => {
+					displayAndLog(this, `Initiating reconnection after ${Math.round(sleepDuration/1000)}s sleep`, 0);
+					// Сначала останавливаем старые соединения
+					this.stopTelegram();
+					// Затем инициализируем заново
+					setTimeout(() => {
+						enqueue(this, this.initTelegram);
+					}, 1000);
+				}, 2000); // Даем системе 2 секунды на стабилизацию
+			});
+
+			this.powerMonitorInitialized = true;
+			displayAndLog(this, "Power monitor initialized for macOS", 0);
+		} catch (error) {
+			displayAndLog(this, `Failed to initialize power monitor: ${error}`, 0);
+			this.initAlternativeSleepDetection();
+		}
+	}
+
+	initAlternativeSleepDetection() {
+		// Альтернативный метод обнаружения сна через отслеживание времени
+		let lastActivityTime = Date.now();
+		const checkInterval = 30000; // Проверяем каждые 30 секунд
+		const sleepThreshold = 120000; // Считаем, что система спала, если прошло более 2 минут
+		
+		const checkForSleep = () => {
+			const currentTime = Date.now();
+			const timeDiff = currentTime - lastActivityTime;
+			
+			if (timeDiff > sleepThreshold) {
+				displayAndLog(this, `Detected potential system sleep (${Math.round(timeDiff/1000)}s gap), reconnecting Telegram`, 0);
+				// Принудительно переподключаемся
+				this.stopTelegram();
+				setTimeout(() => {
+					enqueue(this, this.initTelegram);
+				}, 2000);
+			}
+			
+			lastActivityTime = currentTime;
+		};
+		
+		setInterval(checkForSleep, checkInterval);
+		displayAndLog(this, "Alternative sleep detection initialized", 0);
 	}
 
 	setRestartTelegramInterval(newRestartingIntervalTime: number, sessionType?: Client.SessionType) {
@@ -144,12 +250,34 @@ export default class TelegramSyncPlugin extends Plugin {
 			else if (this.bot && !sessionType && os.type() == "Darwin" && this.isBotConnected()) {
 				try {
 					this.botUser = await this.bot.getMe();
-				} catch {
+				} catch (error) {
+					displayAndLog(this, `Bot connection check failed: ${error}`, 0);
 					this.setBotStatus("disconnected");
 					this.userConnected = false;
+					// Принудительно переподключаемся при ошибке проверки соединения
+					needRestartInterval = true;
 				}
 			}
-		} catch {
+			
+			// Дополнительная проверка для пользовательского соединения на macOS
+			if (!sessionType && os.type() == "Darwin" && this.settings.telegramSessionType == "user") {
+				try {
+					const reconnected = await Client.reconnect(false);
+					if (!reconnected && this.userConnected) {
+						displayAndLog(this, "User connection lost, attempting to reconnect", 0);
+						this.userConnected = false;
+						needRestartInterval = true;
+					}
+				} catch (error) {
+					displayAndLog(this, `User connection check failed: ${error}`, 0);
+					this.userConnected = false;
+					needRestartInterval = true;
+				}
+			}
+			
+			if (needRestartInterval) this.setRestartTelegramInterval(_15sec);
+		} catch (error) {
+			displayAndLog(this, `Restart telegram failed: ${error}`, 0);
 			this.setRestartTelegramInterval(
 				this.restartingIntervalTime < _2min ? this.restartingIntervalTime * 2 : this.restartingIntervalTime,
 			);
@@ -189,6 +317,10 @@ export default class TelegramSyncPlugin extends Plugin {
 		this.addSettingTab(this.settingsTab);
 
 		hideMTProtoAlerts(this);
+		
+		// Initialize power monitor for macOS sleep/wake handling
+		this.initPowerMonitor();
+		
 		// Initialize the Telegram bot when Obsidian layout is fully loaded
 		this.app.workspace.onLayoutReady(async () => {
 			enqueue(this, this.initTelegram);
@@ -208,6 +340,18 @@ export default class TelegramSyncPlugin extends Plugin {
 			this.connectionStatusIndicator = undefined;
 			this.settingsTab = undefined;
 			this.stopTelegram();
+			
+			// Очищаем обработчики событий питания
+			if (this.powerMonitorInitialized && this.powerMonitor && os.type() === "Darwin") {
+				try {
+					this.powerMonitor.removeAllListeners("suspend");
+					this.powerMonitor.removeAllListeners("resume");
+					this.powerMonitor = undefined;
+					this.powerMonitorInitialized = false;
+				} catch (error) {
+					displayAndLog(this, `Failed to cleanup power monitor: ${error}`, 0);
+				}
+			}
 		} catch (e) {
 			displayAndLog(this, e, 0);
 		} finally {
